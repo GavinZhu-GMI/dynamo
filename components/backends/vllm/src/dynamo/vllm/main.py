@@ -143,8 +143,32 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
     clear_endpoint = component.endpoint("clear_kv_blocks")
 
     engine_client, _, default_sampling_params = setup_vllm_engine(config)
+    engine_client, vllm_config, default_sampling_params = setup_vllm_engine(config)
 
-    # TODO register_prefill in similar vein to register_llm
+    # Register the prefill model endpoint
+    if not config.engine_args.data_parallel_rank:  # if rank is 0 or None then register
+        runtime_config = ModelRuntimeConfig()
+
+        # make a `collective_rpc` call to get runtime configuration values
+        logging.info(
+            "Getting engine runtime configuration metadata from vLLM engine..."
+        )
+        runtime_values = get_engine_cache_info(engine_client)
+        runtime_config.total_kv_blocks = runtime_values["num_gpu_blocks"]
+        runtime_config.max_num_seqs = runtime_values["max_num_seqs"]
+        runtime_config.max_num_batched_tokens = runtime_values["max_num_batched_tokens"]
+        runtime_config.tool_call_parser = config.tool_call_parser
+        runtime_config.reasoning_parser = config.reasoning_parser
+
+         await register_llm(
+            ModelType.Backend,
+            generate_endpoint,
+            config.model,
+            config.served_model_name,
+            kv_cache_block_size=config.engine_args.block_size,
+            migration_limit=config.migration_limit,
+            runtime_config=runtime_config,
+        )
 
     handler = PrefillWorkerHandler(
         runtime, component, engine_client, default_sampling_params
