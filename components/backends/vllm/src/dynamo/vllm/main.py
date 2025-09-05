@@ -160,7 +160,7 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
         runtime_config.tool_call_parser = config.tool_call_parser
         runtime_config.reasoning_parser = config.reasoning_parser
 
-         await register_llm(
+        await register_llm(
             ModelType.Backend,
             generate_endpoint,
             config.model,
