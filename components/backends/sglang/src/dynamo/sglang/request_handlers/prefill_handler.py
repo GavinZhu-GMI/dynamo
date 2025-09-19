@@ -61,9 +61,18 @@ class PrefillWorkerHandler(BaseWorkerHandler):
 
         yield bootstrap_info
 
+        # Handle different request structures
+        if "request" in req:
+            input_ids = req["request"]["token_ids"]
+            sampling_params = req["sampling_params"]
+        else:
+            # Direct structure without nested "request" key
+            input_ids = req["token_ids"]
+            sampling_params = req.get("sampling_params", {})
+
         results = await self.engine.async_generate(
-            input_ids=req["request"]["token_ids"],
-            sampling_params=req["sampling_params"],
+            input_ids=input_ids,
+            sampling_params=sampling_params,
             stream=True,
             bootstrap_host=self.bootstrap_host,
             bootstrap_port=self.bootstrap_port,
