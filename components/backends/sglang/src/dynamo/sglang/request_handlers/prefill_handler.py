@@ -47,7 +47,10 @@ class PrefillWorkerHandler(BaseWorkerHandler):
         return bootstrap_host, bootstrap_port
 
     async def generate(self, request: str):
-        req = msgspec.json.decode(request, type=dict)
+        if isinstance(request, dict):
+            req = request
+        else:
+            req = msgspec.json.decode(request, type=dict)
         bootstrap_room = self._generate_bootstrap_room()
 
         bootstrap_info = {
