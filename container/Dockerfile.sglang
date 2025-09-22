@@ -27,7 +27,7 @@ ARG ARCH=amd64
 ARG ARCH_ALT=x86_64
 
 # Make sure to update the dependency version in pyproject.toml when updating this
-ARG SGLANG_VERSION="0.5.0rc2"
+ARG SGLANG_VERSION="0.5.3rc1"
 
 ##################################
 ########## Base Image ############
