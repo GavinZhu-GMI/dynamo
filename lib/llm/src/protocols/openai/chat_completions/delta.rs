@@ -266,7 +266,16 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
             // Propagate prompt token details if provided
             if let Some(prompt_details) = completion_usage.prompt_tokens_details.as_ref() {
-                self.usage.prompt_tokens_details = Some(prompt_details.clone());
+                let mut prompt_details = prompt_details.clone();
+                // Normalize audio_tokens None -> Some(0). Some backends (SGLang) leave it
+                // unset, which serializes as `"audio_tokens": null`; strict downstream
+                // parsers that type it as a plain integer reject null and drop the entire
+                // usage object, losing cached_tokens. Emitting 0 keeps cache-hit reporting
+                // intact without changing the OpenAI-visible semantics.
+                if prompt_details.audio_tokens.is_none() {
+                    prompt_details.audio_tokens = Some(0);
+                }
+                self.usage.prompt_tokens_details = Some(prompt_details);
             }
         }
 

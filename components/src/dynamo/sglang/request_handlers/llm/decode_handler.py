@@ -571,7 +571,16 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     cached_tokens = res["meta_info"]["cached_tokens"]
                     prefill_prompt_tokens_details = None
                     if cached_tokens is not None and cached_tokens > 0:
-                        prefill_prompt_tokens_details = {"cached_tokens": cached_tokens}
+                        # Set audio_tokens explicitly (default 0). Omitting the key makes
+                        # the OpenAI usage serialize "audio_tokens": null, which strict
+                        # downstream parsers (e.g. the GMI llm-proxy) reject, dropping the
+                        # whole usage object and losing the cache-hit count. Read from
+                        # meta_info so a real value flows if SGLang ever reports one
+                        # (audio model through this handler); 0 otherwise.
+                        prefill_prompt_tokens_details = {
+                            "cached_tokens": cached_tokens,
+                            "audio_tokens": res["meta_info"].get("audio_tokens", 0),
+                        }
                     out["completion_usage"] = {
                         "prompt_tokens": input_tokens,
                         "completion_tokens": completion_tokens,
