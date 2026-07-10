@@ -49,6 +49,37 @@ class PriorityPoolOverride:
     target_pool: int  # pool index to route to when priority matches
 
 
+@dataclass
+class OpaquePoolConfig:
+    """An external OpenAI-compatible endpoint with no relay/index visibility.
+
+    Opaque pools are never scored against relay-backed pools (there is no
+    overlap signal to fabricate). They are eligible only via forfeit: when
+    every relay-backed pool is non-viable for the request.
+    """
+
+    name: str
+    url: str  # base URL of the OpenAI-compatible API, e.g. http://gateway/v1
+    model: str  # model name sent to the external endpoint
+    first_chunk_timeout_s: float = 30.0
+    unhealthy_after_failures: int = 3
+    health_cooldown_s: float = 30.0
+
+
+@dataclass
+class ForfeitConfig:
+    """Controls when relay-backed pools are declared non-viable.
+
+    A pool is viable while it has fewer than ``min_samples`` observed requests
+    (cold start) or while its observed TTFT EMA is within
+    ``ttft_viability_factor`` times the request's TTFT target.
+    """
+
+    ttft_ema_alpha: float = 0.2
+    ttft_viability_factor: float = 1.5
+    min_samples: int = 3
+
+
 def _default_pool_priorities(num_pools: int) -> List[int]:
     """Default pool priorities follow pool order: pool 0 is fastest."""
     return list(range(num_pools))
@@ -375,6 +406,10 @@ class GlobalRouterConfig:
     agg_pool_priorities: Optional[List[int]] = None
     agg_pool_selection_strategy: Optional[AggPoolSelectionStrategy] = None
 
+    # --- opaque lane (optional, agg mode only) ---
+    opaque_pools: List[OpaquePoolConfig] = field(default_factory=list)
+    forfeit: ForfeitConfig = field(default_factory=ForfeitConfig)
+
     def validate(self) -> None:
         """Validate configuration consistency."""
         if not isinstance(self.enable_priority_retry, bool):
@@ -565,6 +600,15 @@ class GlobalRouterConfig:
             "agg_pool_priorities",
         )
 
+        opaque_names = [pool.name for pool in self.opaque_pools]
+        if len(opaque_names) != len(set(opaque_names)):
+            raise ValueError(f"opaque pool names must be unique, got {opaque_names}")
+        for pool in self.opaque_pools:
+            if not pool.url or not pool.model:
+                raise ValueError(
+                    f"opaque pool '{pool.name}' requires non-empty url and model"
+                )
+
         agg_strategy = self.agg_pool_selection_strategy
         if agg_strategy.ttft_resolution <= 0:
             raise ValueError(
@@ -729,6 +773,13 @@ def _load_agg_config(data: dict, mode: str) -> GlobalRouterConfig:
         priority_overrides=agg_priority_overrides,
     )
 
+    opaque_pools = [
+        OpaquePoolConfig(**pool) for pool in data.get("opaque_pools", [])
+    ]
+    forfeit = (
+        ForfeitConfig(**data["forfeit"]) if "forfeit" in data else ForfeitConfig()
+    )
+
     config = GlobalRouterConfig(
         mode=mode,
         enable_priority_retry=data.get("enable_priority_retry", False),
@@ -736,7 +787,12 @@ def _load_agg_config(data: dict, mode: str) -> GlobalRouterConfig:
         agg_pool_dynamo_namespaces=data["agg_pool_dynamo_namespaces"],
         agg_pool_priorities=data.get("agg_pool_priorities"),
         agg_pool_selection_strategy=agg_strategy,
+        opaque_pools=opaque_pools,
+        forfeit=forfeit,
     )
 
-    logger.info(f"Loaded agg config: {config.num_agg_pools} agg pools")
+    logger.info(
+        f"Loaded agg config: {config.num_agg_pools} agg pools, "
+        f"{len(config.opaque_pools)} opaque pools"
+    )
     return config
