@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use dynamo_ext_proc::{ExtProcServer, Router};
+use dynamo_ext_proc::{CalibratedPicker, ExtProcServer, Router};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -184,7 +184,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    let picker = Arc::new(router);
+    // Decorator prototype (NV co-design): pass-through unless DYN_DECORATOR is set.
+    let picker = Arc::new(CalibratedPicker::new(Arc::new(router)));
     let server = ExtProcServer::new(picker);
     // Default to TLS to match the Go EPP behavior. Verified working with
     // kGateway (`appProtocol: http2` upstreams negotiate h2 over TLS via ALPN

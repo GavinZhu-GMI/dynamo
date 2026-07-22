@@ -12,12 +12,14 @@
 //! Envoy ──ext-proc──▶ ExtProcServer<epp::Router> ──EndpointPicker──▶ Dynamo KV Router
 //! ```
 
+pub mod decorator;
 pub mod envoy_helpers;
 pub mod epp;
 pub mod picker;
 pub mod proto;
 pub mod server;
 
+pub use decorator::CalibratedPicker;
 pub use epp::Router;
 pub use picker::{Endpoint, EndpointPicker, PickResult, RequestInfo, ResponseUsage};
 pub use server::ExtProcServer;
