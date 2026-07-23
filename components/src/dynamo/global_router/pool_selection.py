@@ -56,9 +56,14 @@ class PriorityPoolOverride:
 class OpaquePoolConfig:
     """An external OpenAI-compatible endpoint with no relay/index visibility.
 
-    Opaque pools are never scored against relay-backed pools (there is no
-    overlap signal to fabricate). They are eligible only via forfeit: when
-    every relay-backed pool is non-viable for the request.
+    Lane feed kinds:
+    - ``feed="none"`` (default): never scored against relay-backed pools
+      (there is no overlap signal to fabricate); eligible only via forfeit,
+      when every relay-backed pool is non-viable for the request.
+    - ``feed="approx"``: additionally maintains a ShadowLane over the
+      router's own egress to this pool, calibrated by backend-reported
+      ``cached_tokens``. Once the lane is trusted, its approximate depth
+      competes in relay-affinity selection; forfeit semantics are unchanged.
     """
 
     name: str
@@ -67,6 +72,12 @@ class OpaquePoolConfig:
     first_chunk_timeout_s: float = 30.0
     unhealthy_after_failures: int = 3
     health_cooldown_s: float = 30.0
+    # "completions" sends the detokenized prompt to /completions; "chat" wraps
+    # the user-visible text as one user message to /chat/completions (for
+    # black boxes whose data plane only parses chat bodies).
+    api: str = "completions"
+    feed: str = "none"  # "none" | "approx"
+    shadow: dict = field(default_factory=dict)  # ShadowLaneConfig overrides
 
 
 @dataclass
@@ -647,6 +658,22 @@ class GlobalRouterConfig:
             if not pool.url or not pool.model:
                 raise ValueError(
                     f"opaque pool '{pool.name}' requires non-empty url and model"
+                )
+            if pool.api not in ("completions", "chat"):
+                raise ValueError(
+                    f"opaque pool '{pool.name}' api must be 'completions' or "
+                    f"'chat', got '{pool.api}'"
+                )
+            if pool.feed not in ("none", "approx"):
+                raise ValueError(
+                    f"opaque pool '{pool.name}' feed must be 'none' or "
+                    f"'approx', got '{pool.feed}'"
+                )
+            if pool.feed == "approx" and not self.relay_affinity.enabled:
+                raise ValueError(
+                    f"opaque pool '{pool.name}' feed='approx' requires "
+                    "relay_affinity.enabled (it competes in affinity selection "
+                    "and reuses its kv_block_size and thresholds)"
                 )
 
         agg_strategy = self.agg_pool_selection_strategy

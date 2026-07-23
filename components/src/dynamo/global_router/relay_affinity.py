@@ -101,23 +101,32 @@ class RelayAffinity:
     async def _log_stats_loop(self) -> None:
         while True:
             await asyncio.sleep(30)
-            for namespace, relay in zip(self.namespaces, self._relays):
-                try:
+            try:
+                for namespace, relay in zip(self.namespaces, self._relays):
                     stats = await relay.stats()
-                except Exception as e:
-                    logger.warning(f"relay stats failed for '{namespace}': {e}")
-                    continue
-                for endpoint in stats.get("endpoints", []):
-                    agg = endpoint["aggregation"]
-                    logger.info(
-                        "RELAY-STATS pool=%s endpoint=%s members=%s "
-                        "contributions=%s unique_blocks=%s",
-                        namespace,
-                        endpoint["serving_endpoint"],
-                        agg["member_count"],
-                        agg["contribution_count"],
-                        agg["unique_block_count"],
-                    )
+                    for endpoint in stats["endpoints"]:
+                        # aggregation/publication are None until the endpoint
+                        # actor materializes.
+                        agg = endpoint["aggregation"]
+                        pub = endpoint["publication"]
+                        logger.info(
+                            "RELAY-STATS pool=%s endpoint=%s lifecycle=%s "
+                            "members=%s contributions=%s unique_blocks=%s "
+                            "publication=%s",
+                            namespace,
+                            endpoint["serving_endpoint"],
+                            endpoint["lifecycle"],
+                            {m["worker_id"]: m["blocks"] for m in agg["members"]}
+                            if agg
+                            else None,
+                            agg["contribution_count"] if agg else None,
+                            agg["unique_block_count"] if agg else None,
+                            pub,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("relay stats loop iteration failed")
 
     async def shutdown(self) -> None:
         if self._stats_task is not None:

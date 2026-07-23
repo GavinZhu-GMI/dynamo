@@ -230,6 +230,9 @@ class GlobalRouterHandler:
             self.config.opaque_pools,
             self.model_name,
             self.config.forfeit.ttft_ema_alpha,
+            kv_block_size=self.config.relay_affinity.kv_block_size
+            if self.config.relay_affinity.enabled
+            else None,
         )
         for client in self.opaque_clients:
             logger.info(
@@ -416,6 +419,23 @@ class GlobalRouterHandler:
                 pool_idx = affinity_idx
                 namespace = self.config.agg_pool_dynamo_namespaces[pool_idx]
 
+            # Approx lanes: a trusted opaque shadow competes against the relay
+            # depths under the same thresholds. Forfeit semantics are separate
+            # and unchanged; this is a positive, calibrated choice.
+            approx = self._select_approx_opaque(token_ids, matches)
+            if approx is not None:
+                client, depth, relay_best = approx
+                logger.info(
+                    "APPROX-AFFINITY: opaque pool '%s' shadow depth %s beats "
+                    "relay best %s; routing to opaque",
+                    client.config.name,
+                    depth,
+                    relay_best,
+                )
+                async for data in client.generate(request):
+                    yield data
+                return
+
         # Opaque lane: forfeit-only semantics. The opaque pool is chosen only
         # when EVERY relay-backed pool is non-viable — never by score
         # comparison against fabricated overlap.
@@ -476,6 +496,37 @@ class GlobalRouterHandler:
             latency_trackers=self.agg_latency_trackers,
         ):
             yield data
+
+    def _select_approx_opaque(
+        self, token_ids: List[int], relay_matches: List[Dict[str, Any]]
+    ):
+        """Best trusted approx-feed opaque pool, if it decisively beats relay.
+
+        Returns (client, depth, relay_best_depth) or None. Thresholds are the
+        relay-affinity ones so 'approx beats relay' means the same thing as
+        'relay beats relay'.
+        """
+        if not self.opaque_clients or self.relay_affinity is None:
+            return None
+        best = None
+        for client in self.opaque_clients:
+            depth = client.approx_depth(token_ids)
+            if depth is None:
+                continue
+            if best is None or depth > best[1]:
+                best = (client, depth)
+        if best is None:
+            return None
+        client, depth = best
+        cfg = self.relay_affinity.config
+        relay_best = max(
+            (m["prefix_depth"] for m in relay_matches if m["ready"]), default=0
+        )
+        if depth < cfg.min_match_blocks:
+            return None
+        if depth - relay_best < cfg.min_lead_blocks:
+            return None
+        return client, depth, relay_best
 
     def _viable_agg_pools(self, ttft_target_ms: Optional[float]) -> List[int]:
         """Return indices of relay-backed agg pools considered viable.

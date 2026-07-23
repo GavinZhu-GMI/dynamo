@@ -27,6 +27,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import aiohttp
 
 from .pool_selection import OpaquePoolConfig
+from .shadow_lane import ShadowLane, ShadowLaneConfig
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +73,17 @@ class OpaquePoolClient:
     tokenization; the detokenize round-trip is a testbed shim.
     """
 
-    def __init__(self, config: OpaquePoolConfig, tokenizer, ema_alpha: float):
+    def __init__(
+        self,
+        config: OpaquePoolConfig,
+        tokenizer,
+        ema_alpha: float,
+        shadow: Optional[ShadowLane] = None,
+    ):
         self.config = config
         self.tokenizer = tokenizer
         self.ema_alpha = ema_alpha
+        self.shadow = shadow
         self.ttft_ema_by_bucket: Dict[int, float] = {}
         self.consecutive_failures = 0
         self.unhealthy_until = 0.0
@@ -83,6 +91,12 @@ class OpaquePoolClient:
 
     def healthy(self) -> bool:
         return time.monotonic() >= self.unhealthy_until
+
+    def approx_depth(self, token_ids: List[int]) -> Optional[int]:
+        """Trusted shadow-lane depth in blocks, or None when not scoreable."""
+        if self.shadow is None or not self.shadow.trusted() or not self.healthy():
+            return None
+        return self.shadow.query(token_ids)
 
     def _record_ttft(self, bucket: int, ttft_ms: float) -> None:
         prev = self.ttft_ema_by_bucket.get(bucket)
@@ -110,12 +124,22 @@ class OpaquePoolClient:
 
     def _build_payload(self, request: Dict[str, Any]) -> Dict[str, Any]:
         token_ids = request["token_ids"]
-        prompt = self.tokenizer.decode(token_ids, skip_special_tokens=False)
         payload: Dict[str, Any] = {
             "model": self.config.model,
-            "prompt": prompt,
             "stream": True,
+            # Ask for the final usage frame; needed for shadow-lane
+            # calibration (cached_tokens) and harmless where unsupported.
+            "stream_options": {"include_usage": True},
         }
+        if self.config.api == "chat":
+            # Chat-only black boxes re-apply their own template; send the
+            # user-visible text without special tokens to avoid nesting ours.
+            text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            payload["messages"] = [{"role": "user", "content": text}]
+        else:
+            payload["prompt"] = self.tokenizer.decode(
+                token_ids, skip_special_tokens=False
+            )
         stop_conditions = request.get("stop_conditions") or {}
         max_tokens = stop_conditions.get("max_tokens")
         if max_tokens is not None:
@@ -132,15 +156,22 @@ class OpaquePoolClient:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Forward a preprocessed request to the opaque endpoint and stream chunks."""
         payload = self._build_payload(request)
-        bucket = isl_bucket(len(request["token_ids"]))
+        request_token_ids = request["token_ids"]
+        bucket = isl_bucket(len(request_token_ids))
+        # Depth we believed at dispatch — the calibration join's prediction.
+        predicted_blocks = (
+            self.shadow.query(request_token_ids) if self.shadow is not None else 0
+        )
+        cached_tokens: Optional[int] = None
         session = await self._ensure_session()
+        path = "/chat/completions" if self.config.api == "chat" else "/completions"
 
         start = time.monotonic()
         first_chunk = True
         finish_reason: Optional[str] = None
         try:
             async with session.post(
-                f"{self.config.url}/completions",
+                f"{self.config.url}{path}",
                 json=payload,
                 # first-chunk timeout governs connect too: a black-box endpoint
                 # that can't even accept the connection within it is unhealthy
@@ -168,6 +199,10 @@ class OpaquePoolClient:
                     if data == b"[DONE]":
                         break
                     chunk = json.loads(data)
+                    usage = chunk.get("usage")
+                    if usage:
+                        details = usage.get("prompt_tokens_details") or {}
+                        cached_tokens = details.get("cached_tokens")
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -181,7 +216,12 @@ class OpaquePoolClient:
                             f"Opaque pool '{self.config.name}': first chunk in "
                             f"{ttft_ms:.0f}ms (isl_bucket={bucket})"
                         )
-                    text = choice.get("text")
+                        if self.shadow is not None:
+                            self.shadow.record_egress(request_token_ids)
+                    if self.config.api == "chat":
+                        text = (choice.get("delta") or {}).get("content")
+                    else:
+                        text = choice.get("text")
                     if text:
                         token_ids = self.tokenizer.encode(
                             text, add_special_tokens=False
@@ -203,16 +243,39 @@ class OpaquePoolClient:
                 f"Opaque pool '{self.config.name}' returned an empty stream"
             )
 
+        if self.shadow is not None and cached_tokens is not None:
+            self.shadow.observe_usage(predicted_blocks, cached_tokens)
+            logger.info(
+                "Shadow calibration join for '%s': predicted=%s blocks, "
+                "cached_tokens=%s, trusted=%s",
+                self.config.name,
+                predicted_blocks,
+                cached_tokens,
+                self.shadow.trusted(),
+            )
+
         yield {"index": 0, "token_ids": [], "finish_reason": finish_reason or "stop"}
 
     def stats(self) -> Dict[str, Any]:
-        return {
+        stats = {
             "name": self.config.name,
             "url": self.config.url,
             "healthy": self.healthy(),
             "consecutive_failures": self.consecutive_failures,
             "ttft_ema_ms_by_isl_bucket": dict(self.ttft_ema_by_bucket),
         }
+        if self.shadow is not None:
+            shadow = self.shadow.stats()
+            stats["shadow"] = {
+                "entries": shadow.entries,
+                "recorded_requests": shadow.recorded_requests,
+                "calibration_samples": shadow.calibration_samples,
+                "mean_abs_err_blocks": shadow.mean_abs_err_blocks,
+                "divergences": shadow.divergences,
+                "ttl_s": shadow.ttl_s,
+                "trusted": self.shadow.trusted(),
+            }
+        return stats
 
 
 def make_tokenizer(model_name: str):
@@ -222,10 +285,36 @@ def make_tokenizer(model_name: str):
     return AutoTokenizer.from_pretrained(model_name)
 
 
+def _make_block_hasher(kv_block_size: int):
+    """Token-ids -> per-block local hashes, matching relay-lane hashing."""
+    from dynamo.llm import compute_block_hash_for_seq
+
+    def hasher(token_ids: List[int]) -> List[int]:
+        return compute_block_hash_for_seq(list(token_ids), kv_block_size)
+
+    return hasher
+
+
 def make_opaque_clients(
-    configs: List[OpaquePoolConfig], model_name: str, ema_alpha: float
+    configs: List[OpaquePoolConfig],
+    model_name: str,
+    ema_alpha: float,
+    kv_block_size: Optional[int] = None,
 ) -> List[OpaquePoolClient]:
     if not configs:
         return []
     tokenizer = make_tokenizer(model_name)
-    return [OpaquePoolClient(cfg, tokenizer, ema_alpha) for cfg in configs]
+    clients = []
+    for cfg in configs:
+        shadow = None
+        if cfg.feed == "approx":
+            # validate() guarantees relay_affinity (and its kv_block_size)
+            # is configured whenever an approx feed exists.
+            assert kv_block_size is not None and kv_block_size > 0
+            shadow = ShadowLane(
+                ShadowLaneConfig(**cfg.shadow),
+                kv_block_size,
+                _make_block_hasher(kv_block_size),
+            )
+        clients.append(OpaquePoolClient(cfg, tokenizer, ema_alpha, shadow=shadow))
+    return clients
