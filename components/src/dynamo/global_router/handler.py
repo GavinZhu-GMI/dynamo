@@ -60,6 +60,9 @@ class GlobalRouterHandler:
         # pool drive forfeit viability; opaque clients populated in initialize()
         self.agg_latency_trackers: Dict[str, PoolLatencyTracker] = {}
         self.opaque_clients: List[OpaquePoolClient] = []
+        # Relay-fed prefix affinity; attached by the entrypoint after
+        # initialize() when config.relay_affinity.enabled (agg mode only).
+        self.relay_affinity: Optional[Any] = None
 
         if self.config.mode == "disagg":
             assert self.config.prefill_pool_dynamo_namespaces is not None
@@ -394,6 +397,24 @@ class GlobalRouterHandler:
         )
         namespace = self.config.agg_pool_dynamo_namespaces[pool_idx]
         assert self.config.agg_pool_priorities is not None
+
+        # Relay-fed prefix affinity: when one relay-backed pool holds a
+        # decisively deeper cached prefix for this request, prefer it over the
+        # SLA-grid choice. Viability/forfeit checks below still apply to the
+        # overridden pool. Opaque pools have no relay lane and are never
+        # considered here.
+        if self.relay_affinity is not None:
+            affinity_idx, matches = self.relay_affinity.select(token_ids)
+            if affinity_idx is not None and affinity_idx != pool_idx:
+                logger.info(
+                    "AFFINITY: relay prefix match overrides grid pool %s -> %s "
+                    "(matches=%s)",
+                    pool_idx,
+                    affinity_idx,
+                    matches,
+                )
+                pool_idx = affinity_idx
+                namespace = self.config.agg_pool_dynamo_namespaces[pool_idx]
 
         # Opaque lane: forfeit-only semantics. The opaque pool is chosen only
         # when EVERY relay-backed pool is non-viable — never by score

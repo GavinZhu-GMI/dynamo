@@ -75,6 +75,17 @@ async def worker(runtime: DistributedRuntime):
     # Initialize connections to local routers
     await handler.initialize()
 
+    if handler.config.relay_affinity.enabled:
+        from .relay_affinity import RelayAffinity
+
+        assert handler.config.agg_pool_dynamo_namespaces is not None
+        relay_affinity = RelayAffinity(
+            handler.config.relay_affinity,
+            handler.config.agg_pool_dynamo_namespaces,
+        )
+        await relay_affinity.start(runtime)
+        handler.relay_affinity = relay_affinity
+
     logger.info(f"Mode: {handler.config.mode}")
     logger.info(f"Pool info: {handler.get_pool_info()}")
 

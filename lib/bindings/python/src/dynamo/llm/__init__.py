@@ -20,6 +20,7 @@ from dynamo._core import HttpAsyncEngine as HttpAsyncEngine
 from dynamo._core import HttpService as HttpService
 from dynamo._core import KserveGrpcService as KserveGrpcService
 from dynamo._core import KvDcRelay as KvDcRelay
+from dynamo._core import KvDcRelayConsumer as KvDcRelayConsumer
 from dynamo._core import KvEventPublisher as KvEventPublisher
 from dynamo._core import KvRouter as KvRouter
 from dynamo._core import KvRouterConfig as KvRouterConfig

@@ -148,3 +148,113 @@ impl KvDcRelay {
             .ok_or_else(|| PyRuntimeError::new_err("KvDcRelay.start() must complete first"))
     }
 }
+
+/// In-process consumer over one or more colocated relays: each relay is one pool lane.
+/// Construct with parallel `relays`/`labels` lists after every relay's `start()` has
+/// completed, then `start()` the consumer and query `find_matches` synchronously.
+#[pyclass]
+pub struct KvDcRelayConsumer {
+    relays: Vec<(String, Arc<llm_rs::kv_dc_relay::KvDcRelay>)>,
+    consumer_instance: u64,
+    inner: Arc<OnceCell<Arc<llm_rs::kv_dc_relay::KvDcRelayConsumer>>>,
+}
+
+#[pymethods]
+impl KvDcRelayConsumer {
+    #[new]
+    #[pyo3(signature = (relays, labels, consumer_instance=1))]
+    fn new(
+        relays: Vec<PyRef<'_, KvDcRelay>>,
+        labels: Vec<String>,
+        consumer_instance: u64,
+    ) -> PyResult<Self> {
+        if relays.len() != labels.len() || relays.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "relays and labels must be non-empty lists of equal length",
+            ));
+        }
+        let relays = labels
+            .into_iter()
+            .zip(relays.iter())
+            .map(|(label, relay)| relay.started().map(|inner| (label, inner)))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(Self {
+            relays,
+            consumer_instance,
+            inner: Arc::new(OnceCell::new()),
+        })
+    }
+
+    fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let relays = self.relays.clone();
+        let consumer_instance = self.consumer_instance;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            inner
+                .get_or_try_init(|| async move {
+                    let sources = relays
+                        .into_iter()
+                        .map(|(label, relay)| llm_rs::kv_dc_relay::RelayConsumerSource {
+                            label,
+                            relay,
+                        })
+                        .collect();
+                    Ok::<_, PyErr>(Arc::new(llm_rs::kv_dc_relay::KvDcRelayConsumer::start(
+                        sources,
+                        consumer_instance,
+                    )))
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
+    /// Prefix-match `token_ids` against every relay lane. Returns one dict per lane,
+    /// in construction order: {"label", "ready", "prefix_depth"} with depth in KV
+    /// blocks of `kv_block_size` tokens. Synchronous and lock-free.
+    #[pyo3(signature = (token_ids, kv_block_size, lora_name=None, cache_namespace=None))]
+    fn find_matches(
+        &self,
+        py: Python<'_>,
+        token_ids: Vec<u32>,
+        kv_block_size: u32,
+        lora_name: Option<String>,
+        cache_namespace: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        if kv_block_size == 0 {
+            return Err(PyRuntimeError::new_err("kv_block_size cannot be 0"));
+        }
+        let consumer = self.consumer_started()?;
+        let hashes = dynamo_kv_router::protocols::compute_block_hash_for_seq(
+            &token_ids,
+            kv_block_size,
+            dynamo_kv_router::protocols::BlockHashOptions {
+                block_mm_infos: None,
+                lora_name: lora_name.as_deref(),
+                cache_namespace: cache_namespace.as_deref(),
+                is_eagle: None,
+            },
+        );
+        let matches = consumer.find_matches(&hashes);
+        pythonize::pythonize(py, &matches)
+            .map(|value| value.unbind())
+            .map_err(to_pyerr)
+    }
+
+    fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let consumer = self.consumer_started()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            consumer.shutdown().await;
+            Ok(())
+        })
+    }
+}
+
+impl KvDcRelayConsumer {
+    fn consumer_started(&self) -> PyResult<Arc<llm_rs::kv_dc_relay::KvDcRelayConsumer>> {
+        self.inner
+            .get()
+            .cloned()
+            .ok_or_else(|| PyRuntimeError::new_err("KvDcRelayConsumer.start() must complete first"))
+    }
+}

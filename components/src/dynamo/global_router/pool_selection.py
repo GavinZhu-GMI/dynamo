@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, cast
 
+from .relay_affinity import RelayAffinityConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -441,12 +443,17 @@ class GlobalRouterConfig:
     opaque_pools: List[OpaquePoolConfig] = field(default_factory=list)
     forfeit: ForfeitConfig = field(default_factory=ForfeitConfig)
 
+    # --- relay-fed prefix affinity (optional, agg mode only) ---
+    relay_affinity: RelayAffinityConfig = field(default_factory=RelayAffinityConfig)
+
     def validate(self) -> None:
         """Validate configuration consistency."""
         if not isinstance(self.enable_priority_retry, bool):
             raise ValueError("enable_priority_retry must be a boolean")
 
         if self.mode == "disagg":
+            if self.relay_affinity.enabled:
+                raise ValueError("relay_affinity is only supported in agg mode")
             self._validate_disagg()
         elif self.mode == "agg":
             self._validate_agg()
@@ -630,6 +637,8 @@ class GlobalRouterConfig:
             self.num_agg_pools,
             "agg_pool_priorities",
         )
+
+        self.relay_affinity.validate()
 
         opaque_names = [pool.name for pool in self.opaque_pools]
         if len(opaque_names) != len(set(opaque_names)):
@@ -858,6 +867,11 @@ def _load_agg_config(data: dict, mode: str) -> GlobalRouterConfig:
     forfeit = (
         ForfeitConfig(**data["forfeit"]) if "forfeit" in data else ForfeitConfig()
     )
+    relay_affinity = (
+        RelayAffinityConfig(**data["relay_affinity"])
+        if "relay_affinity" in data
+        else RelayAffinityConfig()
+    )
 
     config = GlobalRouterConfig(
         mode=mode,
@@ -868,10 +882,12 @@ def _load_agg_config(data: dict, mode: str) -> GlobalRouterConfig:
         agg_pool_selection_strategy=agg_strategy,
         opaque_pools=opaque_pools,
         forfeit=forfeit,
+        relay_affinity=relay_affinity,
     )
 
     logger.info(
         f"Loaded agg config: {config.num_agg_pools} agg pools, "
-        f"{len(config.opaque_pools)} opaque pools"
+        f"{len(config.opaque_pools)} opaque pools, "
+        f"relay_affinity={'on' if config.relay_affinity.enabled else 'off'}"
     )
     return config

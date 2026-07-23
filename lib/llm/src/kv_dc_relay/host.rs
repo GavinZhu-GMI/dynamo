@@ -481,6 +481,25 @@ impl KvDcRelay {
         Ok(())
     }
 
+    /// Handles of every currently materialized endpoint actor, for the in-process
+    /// consumer adapter's subscription seam.
+    pub(crate) async fn actor_handles(&self) -> Vec<(EndpointId, KvDcRelayHandle)> {
+        let statuses: Vec<_> = self
+            .statuses
+            .read()
+            .await
+            .iter()
+            .map(|(endpoint, status)| (endpoint.clone(), status.clone()))
+            .collect();
+        let mut handles = Vec::new();
+        for (endpoint, status) in statuses {
+            if let Some(handle) = status.read().await.actor.clone() {
+                handles.push((endpoint, handle));
+            }
+        }
+        handles
+    }
+
     pub async fn health(&self) -> KvDcRelayHealth {
         let statuses: Vec<_> = self.statuses.read().await.values().cloned().collect();
         let mut active_endpoint_count = 0;

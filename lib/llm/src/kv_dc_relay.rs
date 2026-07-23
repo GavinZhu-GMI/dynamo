@@ -4,10 +4,12 @@
 //! DC-scoped KV-cache Relay and endpoint-independent CKF identity boundary.
 
 mod actor;
+mod consumer;
 mod discovery;
 mod host;
 mod resolution;
 
+pub use consumer::{ConsumerLaneMatch, KvDcRelayConsumer, RelayConsumerSource};
 pub use host::{
     DEFAULT_EXPECTED_UNIQUE_BLOCKS, KvDcRelay, KvDcRelayConfig, KvDcRelayError, KvDcRelayHealth,
 };
