@@ -14,11 +14,16 @@ This is the "relay" lane feed kind; pools without a relay (opaque pools) are
 "none" and are never scored here — they keep forfeit-only semantics.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# First N select() calls are logged at INFO so bring-up shows the raw per-lane
+# matches without enabling debug logging fleet-wide.
+_SELECT_LOG_CALLS = 8
 
 
 @dataclass
@@ -63,6 +68,8 @@ class RelayAffinity:
         self.namespaces = namespaces
         self._relays: List[Any] = []
         self._consumer: Optional[Any] = None
+        self._select_calls = 0
+        self._stats_task: Optional[asyncio.Task] = None
 
     async def start(self, runtime: Any) -> None:
         """Start one relay per pool namespace, then the consumer over all lanes."""
@@ -85,8 +92,37 @@ class RelayAffinity:
             f"Relay consumer started over {len(self.namespaces)} pool lanes "
             f"(kv_block_size={self.config.kv_block_size})"
         )
+        # Diagnostic builds (ckf-diagnostics feature) expose relay.stats();
+        # log per-lane aggregation counters periodically so bring-up can see
+        # whether worker events are reaching each relay at all.
+        if self._relays and hasattr(self._relays[0], "stats"):
+            self._stats_task = asyncio.create_task(self._log_stats_loop())
+
+    async def _log_stats_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            for namespace, relay in zip(self.namespaces, self._relays):
+                try:
+                    stats = await relay.stats()
+                except Exception as e:
+                    logger.warning(f"relay stats failed for '{namespace}': {e}")
+                    continue
+                for endpoint in stats.get("endpoints", []):
+                    agg = endpoint["aggregation"]
+                    logger.info(
+                        "RELAY-STATS pool=%s endpoint=%s members=%s "
+                        "contributions=%s unique_blocks=%s",
+                        namespace,
+                        endpoint["serving_endpoint"],
+                        agg["member_count"],
+                        agg["contribution_count"],
+                        agg["unique_block_count"],
+                    )
 
     async def shutdown(self) -> None:
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            self._stats_task = None
         if self._consumer is not None:
             await self._consumer.shutdown()
             self._consumer = None
@@ -106,6 +142,15 @@ class RelayAffinity:
         if self._consumer is None:
             return None, []
         matches = self._consumer.find_matches(token_ids, self.config.kv_block_size)
+        if self._select_calls < _SELECT_LOG_CALLS:
+            self._select_calls += 1
+            logger.info(
+                "relay affinity select #%s: isl=%s blocks=%s matches=%s",
+                self._select_calls,
+                len(token_ids),
+                len(token_ids) // max(self.config.kv_block_size, 1),
+                matches,
+            )
         ready = [
             (idx, match["prefix_depth"])
             for idx, match in enumerate(matches)
